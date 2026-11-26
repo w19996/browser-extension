@@ -6,6 +6,7 @@
   "homepage": "https://gopeed.com",
   "author": "Levi",
   "scripts": {
+    "test": "node --test tests/*.test.cjs",
     "dev": "plasmo dev",
     "dev:firefox": "plasmo dev --target=firefox-mv2",
     "build": "plasmo build --zip",
@@ -70,6 +71,7 @@
     ],
     "permissions": [
       "downloads",
+      "cookies",
       "webRequest",
       "nativeMessaging",
       "notifications",
@@ -79,6 +81,7 @@
       "firefox": {
         "permissions": [
           "downloads",
+          "cookies",
           "webRequest",
           "webRequestBlocking",
           "*://*/*",

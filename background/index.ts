@@ -13,6 +13,15 @@ import { getFullUrl } from "~options/components/RemoteSettings"
 import { defaultSettings, type Settings } from "~options/types"
 import { getMergedSettings } from "~util/settings"
 
+import {
+  captureHeaders,
+  captureRequest,
+  captureResponse,
+  createCapturedRequest,
+  encodeNativeRequest,
+  type DownloadContext
+} from "./download-context"
+
 export {}
 
 // Native notification utility function
@@ -76,7 +85,10 @@ function initContextMenus() {
     const downloadInfo: DownloadInfo = {
       url: url,
       filename: filename,
-      filesize: 0 // Unknown file size for context menu downloads
+      filesize: 0, // Unknown file size for context menu downloads
+      tabId: tab?.id,
+      incognito: tab?.incognito,
+      referrer: info.pageUrl || tab?.url
     }
 
     // Get download handler and execute
@@ -96,6 +108,7 @@ function initContextMenus() {
 }
 
 let connectNativePort: chrome.runtime.Port | null = null
+let nativeQueue: Promise<unknown> = Promise.resolve()
 
 function connectNative(): boolean {
   if (connectNativePort) {
@@ -113,23 +126,46 @@ function connectNative(): boolean {
   }
 }
 
-async function connectNativeAndPost<T>(
+function connectNativeAndPost<T>(
   message: HostRequest<any>
 ): Promise<HostResponse<T>> {
-  if (connectNative()) {
-    return new Promise((resolve, reject) => {
-      const cb = (response: any) => {
-        connectNativePort.onMessage.removeListener(cb)
-        resolve(response)
+  // The host replies without IDs, so concurrent ping/create messages must be serialized.
+  const pending = nativeQueue.then(() => {
+    if (!connectNative()) throw new Error("Gopeed native host is unavailable")
+    const port = connectNativePort!
+    return new Promise<HostResponse<T>>((resolve, reject) => {
+      const cleanup = () => {
+        clearTimeout(timer)
+        port.onMessage.removeListener(onMessage)
+        port.onDisconnect.removeListener(onDisconnect)
       }
+      const onDisconnect = () => {
+        cleanup()
+        reject(new Error("Gopeed native host disconnected"))
+      }
+      const onMessage = (response: HostResponse<T>) => {
+        cleanup()
+        if (response.code !== 0)
+          reject(new Error(response.message || "Gopeed rejected the request"))
+        else resolve(response)
+      }
+      const timer = setTimeout(() => {
+        cleanup()
+        port.disconnect()
+        reject(new Error("Gopeed native host did not respond"))
+      }, 30000)
+      port.onMessage.addListener(onMessage)
+      port.onDisconnect.addListener(onDisconnect)
       try {
-        connectNativePort.onMessage.addListener(cb)
-        connectNativePort.postMessage(message)
-      } catch (e) {
-        reject(e)
+        port.postMessage(message)
+      } catch (error) {
+        cleanup()
+        reject(error)
       }
     })
-  }
+  })
+  nativeQueue = pending.catch(() => {})
+  return pending
 }
 
 connectNative()
@@ -214,49 +250,12 @@ chrome.runtime.onStartup &&
       // If map grows too large, clear it entirely as a safety measure
       downloadEventSkipMap.clear()
     }
-    if (requestHeaderMap.size > 100) {
-      requestHeaderMap.clear()
-    }
   }, 30000)
 })()
 
-interface DownloadInfo {
-  url: string
+interface DownloadInfo extends DownloadContext {
   filename: string
   filesize: number
-  tabId?: number
-}
-
-const requestHeaderMap = new Map<string, Record<string, string>>()
-
-function storeRequestHeaders(
-  details: chrome.webRequest.WebRequestHeadersDetails
-) {
-  if (!details.requestHeaders || details.requestHeaders.length === 0) {
-    return
-  }
-
-  const requestHeaders = details.requestHeaders.reduce<Record<string, string>>(
-    (acc, header) => {
-      if (header.name && header.value) {
-        acc[header.name] = header.value
-      }
-      return acc
-    },
-    {}
-  )
-
-  if (Object.keys(requestHeaders).length > 0) {
-    requestHeaderMap.set(details.url, requestHeaders)
-  }
-}
-
-function consumeRequestHeaders(url: string): Record<string, string> {
-  const headers = requestHeaderMap.get(url) || {}
-  if (requestHeaderMap.has(url)) {
-    requestHeaderMap.delete(url)
-  }
-  return headers
 }
 
 function downloadFilter(info: DownloadInfo, settings: Settings): boolean {
@@ -309,7 +308,7 @@ function downloadHandler(
   info: DownloadInfo,
   settings: Settings,
   isRunning: boolean = isRunningCache
-): Function {
+): Function | undefined {
   let handler: Function | undefined
   if (settings.remote.enabled === true) {
     handler = handleRemoteDownload(info, settings)
@@ -327,45 +326,67 @@ const downloadEvent =
 // Use a Map to track skip status per-download to avoid race conditions with multiple tabs
 const downloadEventSkipMap = new Map<string, boolean>()
 
+const requestFilter: chrome.webRequest.RequestFilter = {
+  urls: ["http://*/*", "https://*/*"],
+  types: [
+    "main_frame",
+    "sub_frame",
+    "xmlhttprequest",
+    "other",
+    "media",
+    "object"
+  ]
+}
+chrome.webRequest.onBeforeRequest.addListener(captureRequest, requestFilter, [
+  "requestBody"
+])
 chrome.webRequest.onBeforeSendHeaders.addListener(
-  storeRequestHeaders,
-  { urls: ["<all_urls>"], types: ["main_frame", "sub_frame"] },
+  captureHeaders,
+  requestFilter,
   isFirefox ? ["requestHeaders"] : ["requestHeaders", "extraHeaders"]
 )
+chrome.webRequest.onResponseStarted.addListener(
+  captureResponse,
+  requestFilter,
+  ["responseHeaders"]
+)
 
-downloadEvent.addListener(async function (item) {
+downloadEvent.addListener(function (item, suggest) {
   const info: DownloadInfo = {
-    url: item.finalUrl || item.url,
+    ...item,
+    url: item.url,
     filename: item.filename,
     filesize: item.fileSize
   }
   const downloadUrl = item.finalUrl || item.url
   if (isFirefox && downloadEventSkipMap.get(downloadUrl)) {
     downloadEventSkipMap.delete(downloadUrl)
+    suggest?.()
     return
   }
 
   if (!downloadFilter(info, settingsCache)) {
+    suggest?.()
     return
   }
-
-  await chrome.downloads.pause(item.id)
 
   const handler = downloadHandler(info, settingsCache, isRunningCache)
   if (!handler) {
-    await chrome.downloads.resume(item.id)
+    suggest?.()
     return
   }
 
-  await chrome.downloads.cancel(item.id)
-  if (chrome.runtime.lastError) {
-    console.error(chrome.runtime.lastError.message)
-  }
-  if (isFirefox) {
-    await chrome.downloads.erase({ id: item.id })
-  }
-
-  handler()
+  ;(async () => {
+    try {
+      if (isFirefox) await chrome.downloads.pause(item.id)
+      await handler()
+    } finally {
+      // A captured download stays with Gopeed even if handing it over fails.
+      await chrome.downloads.cancel(item.id)
+      if (isFirefox) await chrome.downloads.erase({ id: item.id })
+    }
+  })().catch((error) => console.error(error))
+  return !isFirefox
 })
 
 function checkContentDisposition(
@@ -646,18 +667,14 @@ function handleNativeDownload(
   }
 
   return async () => {
-    const req = await toCreateRequest(info)
     try {
+      const req = await toCreateRequest(info)
       await connectNativeAndPost<string>({
         method: "create",
         meta: {
           silent: !settings.confirmBeforeDownload
         },
-        params: btoa(
-          JSON.stringify({
-            req
-          })
-        )
+        params: encodeNativeRequest({ req })
       })
 
       if (!settings.confirmBeforeDownload) {
@@ -669,29 +686,17 @@ function handleNativeDownload(
       }
     } catch (e) {
       console.error(e)
-      if (!settings.confirmBeforeDownload) {
-        await showNativeNotification(
-          "error",
-          t("notification_create_error"),
-          t("notification_native_error_message")
-        )
-      }
+      await showNativeNotification(
+        "error",
+        t("notification_create_error"),
+        t("notification_native_error_message")
+      )
     }
   }
 }
 
 async function toCreateRequest(info: DownloadInfo): Promise<Request> {
-  const capturedHeaders = consumeRequestHeaders(info.url)
-  // Force an identity response body to avoid encoded payloads that break multi-part downloading.
-  return {
-    url: info.url,
-    extra: {
-      header: {
-        ...capturedHeaders,
-        "Accept-Encoding": "identity"
-      }
-    }
-  }
+  return createCapturedRequest(info)
 }
 
 function isDomainMatch(host: string, pattern: string): boolean {
